@@ -1,0 +1,17 @@
+{
+  "name": "@vibecoding/vqa",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Shared Playwright + Vision AI visual quality assurance tool",
+  "main": "vqa-engine.mjs",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["vqa", "playwright", "testing", "visual-qa"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.87.0",
+    "playwright": "^1.59.1"
+  }
+}

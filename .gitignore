@@ -1,0 +1,4 @@
+node_modules/
+.agent/reports/
+*.log
+.DS_Store
