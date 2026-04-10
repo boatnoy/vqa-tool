@@ -117,3 +117,136 @@ Be concise, max 150 words.`,
     return null;
   }
 }
+
+/**
+ * Compare two images using Claude Vision AI.
+ *
+ * Image A is the reference (target). Image B is the agent's actual output.
+ * Returns a similarity score 0-100 plus list of differences.
+ *
+ * @param {string} referencePath — absolute path to reference image (PNG/JPG)
+ * @param {string} actualPath — absolute path to actual image (PNG/JPG)
+ * @param {Object} [options]
+ * @param {string} [options.criteria] — focus area, e.g. "button styling, ignore copy"
+ * @param {number} [options.threshold=80] — pass threshold (0-100)
+ * @returns {Promise<{ similarity: number, pass: boolean, differences: string[], rawFeedback: string } | null>}
+ */
+export async function compareImages(referencePath, actualPath, options = {}) {
+  const { criteria = "", threshold = 80 } = options;
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    console.log("\n  No ANTHROPIC_API_KEY — cannot compare images");
+    console.log("     Set ANTHROPIC_API_KEY env to enable A/B comparison");
+    return null;
+  }
+
+  if (!fs.existsSync(referencePath)) {
+    console.error(`  Reference image not found: ${referencePath}`);
+    return null;
+  }
+  if (!fs.existsSync(actualPath)) {
+    console.error(`  Actual image not found: ${actualPath}`);
+    return null;
+  }
+
+  const referenceData = fs.readFileSync(referencePath).toString("base64");
+  const actualData = fs.readFileSync(actualPath).toString("base64");
+
+  const refMime = referencePath.toLowerCase().endsWith(".jpg") || referencePath.toLowerCase().endsWith(".jpeg")
+    ? "image/jpeg"
+    : "image/png";
+  const actMime = actualPath.toLowerCase().endsWith(".jpg") || actualPath.toLowerCase().endsWith(".jpeg")
+    ? "image/jpeg"
+    : "image/png";
+
+  console.log("\n  Comparing images via Claude Vision...");
+  console.log(`     Reference: ${path.basename(referencePath)}`);
+  console.log(`     Actual:    ${path.basename(actualPath)}`);
+  if (criteria) console.log(`     Criteria:  ${criteria}`);
+
+  try {
+    const client = new Anthropic({ apiKey });
+
+    const focusInstruction = criteria
+      ? `\n\nFOCUS AREA: ${criteria}\nPrioritize differences in this area when scoring.`
+      : "";
+
+    const response = await client.messages.create({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1000,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "image",
+              source: { type: "base64", media_type: refMime, data: referenceData },
+            },
+            { type: "text", text: "Image A — REFERENCE (target design)" },
+            {
+              type: "image",
+              source: { type: "base64", media_type: actMime, data: actualData },
+            },
+            { type: "text", text: "Image B — ACTUAL (agent's implementation)" },
+            {
+              type: "text",
+              text: `You are a senior UI design reviewer. Compare Image A (reference) with Image B (actual implementation).
+
+Evaluate VISUAL SIMILARITY focusing on:
+- Layout structure (positioning, alignment, spacing)
+- Color palette (background, text, accent colors)
+- Typography (font weight, size, hierarchy)
+- Component styling (border-radius, shadows, borders)
+- Visual polish (consistency, professionalism)
+
+IGNORE differences in:
+- Actual text/copy content (placeholder text is fine)
+- Image content within frames (focus on the frame itself)
+- Browser chrome or scrollbars
+- Aspect ratio differences (compare visual style, not exact pixel layout)
+${focusInstruction}
+
+OUTPUT FORMAT (strict — first line must match):
+SIMILARITY: NN%
+
+Then a numbered list of UP TO 5 most important differences, each with a CSS fix suggestion:
+1. <difference> → <CSS fix>
+2. ...
+
+Scoring guide:
+- 95-100% = visually identical, ship it
+- 85-94%  = minor polish needed, mostly there
+- 70-84%  = recognizable but visible gaps, list specific fixes
+- 50-69%  = right direction, multiple issues
+- < 50%   = significant rework needed
+
+Be concise. Total response under 300 words.`,
+            },
+          ],
+        },
+      ],
+    });
+
+    const rawFeedback = response.content[0]?.text || "";
+    if (!rawFeedback) return null;
+
+    // Parse similarity score
+    const simMatch = rawFeedback.match(/SIMILARITY:\s*(\d+)\s*%/i);
+    const similarity = simMatch ? parseInt(simMatch[1], 10) : 0;
+
+    // Parse differences (numbered list lines)
+    const differences = rawFeedback
+      .split("\n")
+      .filter((line) => /^\s*\d+[\.\)]\s+/.test(line))
+      .map((line) => line.replace(/^\s*\d+[\.\)]\s+/, "").trim())
+      .filter((line) => line.length > 0);
+
+    const pass = similarity >= threshold;
+
+    return { similarity, pass, differences, rawFeedback };
+  } catch (err) {
+    console.warn(`  Vision API error: ${err.message}`);
+    return null;
+  }
+}

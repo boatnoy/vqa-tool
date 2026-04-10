@@ -75,11 +75,46 @@ export default {
 };
 ```
 
+## Comparing 2 images (A vs B)
+
+Use `compare.mjs` when you have a reference design (e.g., a screenshot from
+Figma, a competitor's site, or a previous iteration) and want Claude Vision
+to score how close your actual implementation matches it.
+
+```bash
+# Basic compare
+node ~/VibeCoding/tools/vqa/compare.mjs ./design.png ./actual.png
+
+# Focus on specific area + custom threshold
+node ~/VibeCoding/tools/vqa/compare.mjs ./line-button.png ./my-button.png \
+  --criteria "button shape, color, padding" \
+  --threshold 90
+```
+
+**Output:**
+- Similarity score 0-100%
+- Up to 5 most important differences with CSS fix suggestions
+- Pass/fail vs threshold (default 80%)
+
+**Exit codes:**
+- `0` = PASS (similarity ≥ threshold)
+- `1` = FAIL (similarity < threshold)
+- `3` = SETUP_ERROR (missing API key, files not found)
+
+**Requires:** `ANTHROPIC_API_KEY` environment variable
+
+Compares are visual-style focused — copy text and image content within frames
+are ignored, the comparator looks at layout, colors, typography, spacing,
+and overall polish.
+
 ## Architecture
 
 - **vqa-engine.mjs** — Playwright + 4-layer anti-cheat (hard gate, console, blocked patterns, screenshots)
 - **run-vqa.mjs** — CLI runner, accepts `--config`, dispatches to engine
-- **vision-evaluator.mjs** — Optional Claude Sonnet A-F grading (set `ANTHROPIC_API_KEY`)
+- **compare.mjs** — Standalone A/B image comparator (no Playwright needed)
+- **vision-evaluator.mjs** — Claude Sonnet grader. Two functions:
+  - `evaluateWithVision()` — single-image A-F grading
+  - `compareImages()` — A vs B similarity score (0-100%)
 
 ## Login Modes
 
