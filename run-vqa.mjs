@@ -21,7 +21,16 @@ import { pathToFileURL } from "url";
 import * as fs from "fs";
 import * as path from "path";
 import { VQAEngine } from "./vqa-engine.mjs";
-import { evaluateWithVision } from "./vision-evaluator.mjs";
+import { evaluateWithVision, compareImages } from "./vision-evaluator.mjs";
+
+// ─────────────────────────────────────────────────────────────
+// CONSTANTS (must be top-level for hoisting / TDZ)
+// ─────────────────────────────────────────────────────────────
+const TASK_WORKSPACE_ROOT = path.resolve(".agent/vqa-tasks");
+
+function taskJsonPath(slug) {
+  return path.join(TASK_WORKSPACE_ROOT, slug, "task.json");
+}
 
 // ─────────────────────────────────────────────────────────────
 // CLI ARGS
@@ -37,6 +46,9 @@ const { values: args } = parseArgs({
     vision:     { type: "boolean", default: false },
     headed:     { type: "boolean", default: false },
     timeout:    { type: "string", default: "10000" },
+    task:       { type: "string" },     // opt-in: track this run as part of a task workspace
+    reference:  { type: "string" },     // opt-in: name (within task) or absolute path to reference image
+    threshold:  { type: "string", default: "80" },  // pass threshold for --reference comparison
     help:       { type: "boolean", default: false },
   },
   strict: true,
@@ -66,6 +78,14 @@ OPTIONS:
   --headed     Show browser window (debug)
   --timeout    waitFor timeout in ms (default: 10000)
   --help       Show this help
+
+TASK MODE (opt-in — for iteration tracking):
+  --task <slug>       Save this run as a new iteration of an existing task
+                      (use task.mjs create <slug> first to set it up)
+  --reference <name>  Compare each screenshot against a reference image.
+                      Either an absolute path OR a name in the task's
+                      references/ folder (e.g. iter-1-reference.png)
+  --threshold <n>     Comparison pass threshold 0-100 (default: 80)
 
 EXIT CODES:
   0 = PASS        1 = FAIL        2 = BLOCKED        3 = SETUP_ERROR
@@ -134,6 +154,28 @@ if (args.all && (!config.tests || config.tests.length === 0)) {
   process.exit(3);
 }
 
+// Validate task tracking flags
+if (args.task) {
+  const taskFile = taskJsonPath(args.task);
+  if (!fs.existsSync(taskFile)) {
+    console.error(`SETUP_ERROR: task workspace not found: ${args.task}`);
+    console.error(`   Run: node ~/VibeCoding/tools/vqa/task.mjs create ${args.task}`);
+    process.exit(3);
+  }
+}
+
+if (args.reference && !args.task) {
+  console.error("SETUP_ERROR: --reference requires --task");
+  console.error("   Comparisons must belong to a task workspace for iteration tracking");
+  process.exit(3);
+}
+
+const taskThreshold = parseInt(args.threshold, 10);
+if (args.reference && (isNaN(taskThreshold) || taskThreshold < 0 || taskThreshold > 100)) {
+  console.error(`SETUP_ERROR: --threshold must be 0-100, got: ${args.threshold}`);
+  process.exit(3);
+}
+
 // ─────────────────────────────────────────────────────────────
 // PRE-FLIGHT
 // ─────────────────────────────────────────────────────────────
@@ -187,6 +229,133 @@ function getViewports() {
 }
 
 // ─────────────────────────────────────────────────────────────
+// TASK WORKSPACE HELPERS (opt-in via --task)
+// ─────────────────────────────────────────────────────────────
+
+function loadTaskWorkspace(slug) {
+  const p = taskJsonPath(slug);
+  if (!fs.existsSync(p)) return null;
+  return JSON.parse(fs.readFileSync(p, "utf8"));
+}
+
+function saveTaskWorkspace(slug, task) {
+  fs.writeFileSync(taskJsonPath(slug), JSON.stringify(task, null, 2));
+}
+
+/**
+ * Resolve --reference value either as absolute path or as a name in the task's
+ * references/ folder. Returns absolute path or null if not found.
+ */
+function resolveReferencePath(slug, refArg) {
+  if (!refArg) return null;
+
+  // Try as absolute path first
+  const asPath = path.resolve(refArg);
+  if (fs.existsSync(asPath) && fs.statSync(asPath).isFile()) {
+    return asPath;
+  }
+
+  // Try as name within the task's references/ folder
+  const refsDir = path.join(TASK_WORKSPACE_ROOT, slug, "references");
+  if (fs.existsSync(refsDir)) {
+    // Exact match (with or without extension)
+    const exact = path.join(refsDir, refArg);
+    if (fs.existsSync(exact)) return exact;
+
+    // Try common extensions
+    for (const ext of [".png", ".jpg", ".jpeg"]) {
+      const withExt = path.join(refsDir, refArg + ext);
+      if (fs.existsSync(withExt)) return withExt;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * After engine runs, persist this run as a new iteration in the task workspace.
+ * Optionally compare each screenshot against a reference image via Claude Vision.
+ *
+ * Returns the iteration result object (also persisted to comparison.json).
+ */
+async function recordTaskIteration(slug, engine, referencePath, threshold) {
+  const task = loadTaskWorkspace(slug);
+  if (!task) {
+    console.error(`\nTask workspace not found: ${slug}`);
+    console.error(`   Run: node ~/VibeCoding/tools/vqa/task.mjs create ${slug}`);
+    return null;
+  }
+
+  // Auto-increment iteration number
+  const iterNum = (task.iterationCount || 0) + 1;
+  const iterDir = path.join(TASK_WORKSPACE_ROOT, slug, "iterations", String(iterNum).padStart(3, "0"));
+  fs.mkdirSync(iterDir, { recursive: true });
+
+  // Copy all screenshots (ephemeral → permanent)
+  const copiedScreenshots = [];
+  for (const ss of engine.screenshots) {
+    // ss is a basename relative to engine.outDir
+    const sourcePath = path.join(engine.outDir, ss);
+    if (!fs.existsSync(sourcePath)) continue;
+    const destPath = path.join(iterDir, ss);
+    fs.copyFileSync(sourcePath, destPath);
+    copiedScreenshots.push(ss);
+  }
+
+  // Optional: comparison vs reference
+  let comparisonResult = null;
+  if (referencePath) {
+    if (copiedScreenshots.length === 0) {
+      console.warn(`\n  No screenshots to compare for iteration ${iterNum}`);
+    } else {
+      // Compare against the FIRST screenshot (or only one if single test)
+      const firstScreenshot = path.join(iterDir, copiedScreenshots[0]);
+      console.log(`\n  Recording iteration ${iterNum} for task: ${slug}`);
+      const result = await compareImages(referencePath, firstScreenshot, {
+        threshold,
+      });
+      if (result) {
+        comparisonResult = result;
+        console.log(`     Similarity: ${result.similarity}%  ${result.pass ? "PASS" : "FAIL"} (threshold ${threshold}%)`);
+        if (result.differences.length > 0) {
+          console.log("     Top differences:");
+          result.differences.slice(0, 3).forEach((d, i) => {
+            console.log(`       ${i + 1}. ${d.length > 100 ? d.slice(0, 100) + "..." : d}`);
+          });
+        }
+      }
+    }
+  }
+
+  // Build iteration record
+  const iteration = {
+    number: iterNum,
+    timestamp: new Date().toISOString(),
+    screenshots: copiedScreenshots,
+    referenceUsed: referencePath ? path.basename(referencePath) : null,
+    similarity: comparisonResult?.similarity ?? null,
+    pass: comparisonResult?.pass ?? null,
+    threshold: referencePath ? threshold : null,
+  };
+
+  // Save full comparison.json in iteration folder
+  fs.writeFileSync(
+    path.join(iterDir, "comparison.json"),
+    JSON.stringify({ iteration, comparison: comparisonResult }, null, 2)
+  );
+
+  // Update task.json
+  task.iterationCount = iterNum;
+  task.iterations = task.iterations || [];
+  task.iterations.push(iteration);
+  task.updatedAt = new Date().toISOString();
+  saveTaskWorkspace(slug, task);
+
+  console.log(`  ✓ Iteration ${iterNum} saved to ${path.relative(process.cwd(), iterDir)}`);
+  return iteration;
+}
+
+// ─────────────────────────────────────────────────────────────
 // MAIN
 // ─────────────────────────────────────────────────────────────
 async function main() {
@@ -198,7 +367,10 @@ async function main() {
   console.log(`   mode:        ${args.all ? "all tests" : args.url}`);
   console.log(`   responsive:  ${args.responsive}`);
   console.log(`   vision:      ${args.vision}`);
-  console.log(`   reportDir:   ${config.reportDir || ".agent/reports/vqa"}\n`);
+  console.log(`   reportDir:   ${config.reportDir || ".agent/reports/vqa"}`);
+  if (args.task) console.log(`   task:        ${args.task}`);
+  if (args.reference) console.log(`   reference:   ${args.reference} (threshold ${taskThreshold}%)`);
+  console.log("");
 
   await preflight();
 
@@ -280,6 +452,21 @@ async function main() {
     }
   }
 
+  // ── Task workspace iteration tracking (opt-in via --task) ──
+  let taskIteration = null;
+  if (args.task) {
+    let resolvedRef = null;
+    if (args.reference) {
+      resolvedRef = resolveReferencePath(args.task, args.reference);
+      if (!resolvedRef) {
+        console.error(`\n  Reference not found: "${args.reference}"`);
+        console.error(`     Tried: absolute path AND .agent/vqa-tasks/${args.task}/references/`);
+        // Continue without comparison rather than aborting — screenshots still saved
+      }
+    }
+    taskIteration = await recordTaskIteration(args.task, engine, resolvedRef, taskThreshold);
+  }
+
   // ── Write JSON report ──
   const timestamp = Date.now();
   const report = {
@@ -294,6 +481,8 @@ async function main() {
     pass: engine.results.every((r) => r.pass),
     tests: engine.results,
     visionVerdict: visionResult,
+    task: args.task || null,
+    iteration: taskIteration,
   };
 
   const reportPath = path.join(engine.outDir, `vqa-${timestamp}.json`);
